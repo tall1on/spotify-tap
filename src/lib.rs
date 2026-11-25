@@ -7,6 +7,12 @@
 //! heartbeat in the shared header; when the heartbeat stops the hook passes
 //! audio through again, so a crashed or stopped consumer never leaves Spotify
 //! permanently silent.
+//!
+//! Header version 2 adds a seqlock-protected `(write_bytes, qpc)` pair so the
+//! reader can measure Spotify's real render rate precisely instead of guessing
+//! it from poll timing. It also signals a named event on every write so the
+//! reader does not have to poll, and counts bytes dropped because the ring was
+//! full.
 
 use std::{
     collections::HashMap,
@@ -22,7 +28,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
-    core::{GUID, Interface, HRESULT, PCWSTR},
+    core::{Interface, GUID, HRESULT, PCWSTR},
     Win32::{
         Foundation::{
             CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS, HANDLE,
@@ -43,21 +49,26 @@ use windows::{
                 CreateFileMappingW, MapViewOfFile, VirtualProtect, FILE_MAP_ALL_ACCESS,
                 PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
             },
-            Threading::{CreateMutexW, GetCurrentProcessId},
+            Performance::QueryPerformanceCounter,
+            Threading::{CreateEventW, CreateMutexW, GetCurrentProcessId, SetEvent},
         },
     },
 };
 
 const MAGIC: u32 = 0x5054_5053; // "SPTP"
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
-const HEADER_SIZE: usize = 64;
+const HEADER_SIZE: usize = 128;
 const RING_CAPACITY: usize = 4 * 1024 * 1024;
 const HEARTBEAT_TIMEOUT_MS: u64 = 1_500;
+/// StartTap result when another (older) tap generation owns this process.
+/// Consumers should fall back to the owner's version 1 mapping.
+const ERR_OTHER_OWNER: i32 = 20;
 
 type GetBufferFn = unsafe extern "system" fn(*mut c_void, u32, *mut *mut u8) -> HRESULT;
 type ReleaseBufferFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> HRESULT;
 
+/// `reserved2` keeps the header at a stable 128 bytes for future fields.
 #[repr(C)]
 struct Header {
     magic: u32,
@@ -72,6 +83,13 @@ struct Header {
     write_bytes: AtomicU64,
     read_bytes: AtomicU64,
     capacity: u64,
+    /// Seqlock over `qpc` + `write_bytes`: odd while the producer updates.
+    seq: AtomicU64,
+    /// `QueryPerformanceCounter` value of the newest `write_bytes`.
+    qpc: AtomicU64,
+    /// Bytes discarded because the ring was full.
+    dropped_bytes: AtomicU64,
+    reserved2: [u64; 5],
 }
 
 #[derive(Clone, Copy)]
@@ -92,6 +110,7 @@ static HOOK_MUTEX: AtomicUsize = AtomicUsize::new(0);
 static VTABLE: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+static WAKE: AtomicUsize = AtomicUsize::new(0);
 static RESTORE_LOCK: Mutex<()> = Mutex::new(());
 
 fn buffers() -> &'static Mutex<HashMap<usize, BufferState>> {
@@ -111,6 +130,12 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn qpc_now() -> u64 {
+    let mut value = 0i64;
+    let _ = unsafe { QueryPerformanceCounter(&mut value) };
+    value as u64
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -140,11 +165,17 @@ unsafe fn write_ring(bytes: &[u8]) {
     }
     let capacity = (*header).capacity as usize;
     if capacity == 0 || bytes.len() > capacity {
+        (*header)
+            .dropped_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         return;
     }
     let write = (*header).write_bytes.load(Ordering::Relaxed);
     let read = (*header).read_bytes.load(Ordering::Acquire);
     if write.wrapping_sub(read) + bytes.len() as u64 > capacity as u64 {
+        (*header)
+            .dropped_bytes
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         return;
     }
     let ring = (header as *mut u8).add(HEADER_SIZE);
@@ -154,9 +185,19 @@ unsafe fn write_ring(bytes: &[u8]) {
     if first < bytes.len() {
         ptr::copy_nonoverlapping(bytes.as_ptr().add(first), ring, bytes.len() - first);
     }
+    // Publish write_bytes together with a matching QPC reading. The single
+    // producer keeps the seqlock cheap; the reader retries on a torn pair.
+    let sequence = (*header).seq.load(Ordering::Relaxed);
+    (*header).seq.store(sequence + 1, Ordering::Release);
+    (*header).qpc.store(qpc_now(), Ordering::Relaxed);
     (*header)
         .write_bytes
         .store(write + bytes.len() as u64, Ordering::Release);
+    (*header).seq.store(sequence + 2, Ordering::Release);
+    let wake = WAKE.load(Ordering::Acquire);
+    if wake != 0 {
+        let _ = SetEvent(HANDLE(wake as *mut c_void));
+    }
 }
 
 unsafe extern "system" fn get_buffer_hook(
@@ -220,6 +261,20 @@ unsafe extern "system" fn release_buffer_hook(
     original(this, frames, flags)
 }
 
+fn claim_wake_event(pid: u32) -> HANDLE {
+    let name = wide(&format!("Local\\SpotifyTapEvent_{pid}_v2"));
+    match unsafe { CreateEventW(None, false, false, PCWSTR(name.as_ptr())) } {
+        Ok(event) => {
+            WAKE.store(event.0 as usize, Ordering::Release);
+            event
+        }
+        Err(error) => {
+            log(&format!("CreateEventW failed: {error}"));
+            HANDLE(std::ptr::null_mut())
+        }
+    }
+}
+
 fn setup() -> Result<(), i32> {
     let pid = unsafe { GetCurrentProcessId() };
     let mutex_name = wide(&format!("Local\\SpotifyTapHook_{pid}_v1"));
@@ -236,13 +291,13 @@ fn setup() -> Result<(), i32> {
         let _ = unsafe { CloseHandle(mutex) };
         if owned == 0 {
             log("another tap version already owns this process");
-            return Ok(());
+            return Err(ERR_OTHER_OWNER);
         }
     } else {
         HOOK_MUTEX.store(mutex.0 as usize, Ordering::SeqCst);
     }
 
-    let mapping_name = wide(&format!("Local\\SpotifyTap_{pid}_v1"));
+    let mapping_name = wide(&format!("Local\\SpotifyTap_{pid}_v2"));
     let mapping: HANDLE = unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
@@ -279,6 +334,10 @@ fn setup() -> Result<(), i32> {
     }
     SHARED.store(view.Value as usize, Ordering::Release);
 
+    // Created after the mapping so a failed setup never leaves a wake handle
+    // behind, and before the hook so the first rendered frame can signal it.
+    let wake = claim_wake_event(pid);
+
     if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
         log("CoInitializeEx failed");
         return Err(4);
@@ -288,10 +347,11 @@ fn setup() -> Result<(), i32> {
             log(&format!("CoCreateInstance failed: {error}"));
             5
         })?;
-    let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.map_err(|error| {
-        log(&format!("GetDefaultAudioEndpoint failed: {error}"));
-        6
-    })?;
+    let device =
+        unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.map_err(|error| {
+            log(&format!("GetDefaultAudioEndpoint failed: {error}"));
+            6
+        })?;
     let client: IAudioClient = unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) }
         .map_err(|error| {
             log(&format!("Activate IAudioClient failed: {error}"));
@@ -339,21 +399,19 @@ fn setup() -> Result<(), i32> {
     SAMPLE_RATE.store(sample_rate, Ordering::SeqCst);
     FRAME_BYTES.store(8, Ordering::SeqCst);
 
-    let initialized = unsafe {
-        client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_format, None)
-    };
+    let initialized =
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_format, None) };
     unsafe { CoTaskMemFree(Some(mix_format as *const c_void)) };
     initialized.map_err(|error| {
         log(&format!("Initialize failed: {error}"));
         10
     })?;
 
-    let render: IAudioRenderClient = unsafe { client.GetService::<IAudioRenderClient>() }.map_err(
-        |error| {
+    let render: IAudioRenderClient =
+        unsafe { client.GetService::<IAudioRenderClient>() }.map_err(|error| {
             log(&format!("GetService IAudioRenderClient failed: {error}"));
             11
-        },
-    )?;
+        })?;
     let raw = render.as_raw() as *mut usize;
     let vtable = unsafe { *(raw as *mut *mut usize) };
     if vtable.is_null() {
@@ -398,7 +456,8 @@ fn setup() -> Result<(), i32> {
         (*header).version = VERSION;
     }
     log(&format!(
-        "patched pid={pid} vtable={vtable:p} get={get_buffer:x} release={release_buffer:x}"
+        "patched pid={pid} vtable={vtable:p} get={get_buffer:x} release={release_buffer:x} wake={:p}",
+        wake.0
     ));
     Ok(())
 }
@@ -455,8 +514,7 @@ fn spawn_monitor(generation: u64) {
                 false
             } else {
                 let heartbeat = unsafe { (*header).heartbeat_ms.load(Ordering::Acquire) };
-                heartbeat != 0
-                    && now_ms().saturating_sub(heartbeat) < HEARTBEAT_TIMEOUT_MS
+                heartbeat != 0 && now_ms().saturating_sub(heartbeat) < HEARTBEAT_TIMEOUT_MS
             };
             if fresh {
                 stale_since = None;
