@@ -2,8 +2,8 @@
 node_modules/
 
 # Build output
-/target/
-/dist/
+# /target/
+# /dist/
 
 # TypeScript and test caches
 *.tsbuildinfo
