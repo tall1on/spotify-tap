@@ -2,7 +2,7 @@
 node_modules/
 
 # Build output
-# /target/
+/target/
 # /dist/
 
 # TypeScript and test caches
