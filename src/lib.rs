@@ -22,7 +22,7 @@ use std::{
     mem::size_of,
     ptr,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -186,13 +186,17 @@ unsafe fn write_ring(bytes: &[u8]) {
         ptr::copy_nonoverlapping(bytes.as_ptr().add(first), ring, bytes.len() - first);
     }
     // Publish write_bytes together with a matching QPC reading. The single
-    // producer keeps the seqlock cheap; the reader retries on a torn pair.
+    // producer keeps the seqlock cheap; the reader retries on a torn pair. The
+    // fences order the sequence updates around the payload stores on weak
+    // memory models, not just on x86.
     let sequence = (*header).seq.load(Ordering::Relaxed);
-    (*header).seq.store(sequence + 1, Ordering::Release);
+    (*header).seq.store(sequence + 1, Ordering::Relaxed);
+    fence(Ordering::SeqCst);
     (*header).qpc.store(qpc_now(), Ordering::Relaxed);
     (*header)
         .write_bytes
         .store(write + bytes.len() as u64, Ordering::Release);
+    fence(Ordering::SeqCst);
     (*header).seq.store(sequence + 2, Ordering::Release);
     let wake = WAKE.load(Ordering::Acquire);
     if wake != 0 {
@@ -297,46 +301,56 @@ fn setup() -> Result<(), i32> {
         HOOK_MUTEX.store(mutex.0 as usize, Ordering::SeqCst);
     }
 
-    let mapping_name = wide(&format!("Local\\SpotifyTap_{pid}_v2"));
-    let mapping: HANDLE = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            None,
-            PAGE_READWRITE,
-            0,
-            (HEADER_SIZE + RING_CAPACITY) as u32,
-            PCWSTR(mapping_name.as_ptr()),
-        )
+    // The mapping, view and wake event survive StopTap so a restart does not
+    // leak another 4 MiB view and a handle inside Spotify. Reusing the view is
+    // safe because the header is reset below and the ring is empty again.
+    let mut view_value = SHARED.load(Ordering::Acquire);
+    if view_value == 0 {
+        let mapping_name = wide(&format!("Local\\SpotifyTap_{pid}_v2"));
+        let mapping: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE,
+                0,
+                (HEADER_SIZE + RING_CAPACITY) as u32,
+                PCWSTR(mapping_name.as_ptr()),
+            )
+        }
+        .map_err(|error| {
+            log(&format!("CreateFileMappingW failed: {error}"));
+            2
+        })?;
+        let view = unsafe {
+            MapViewOfFile(
+                mapping,
+                FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                HEADER_SIZE + RING_CAPACITY,
+            )
+        };
+        if view.Value.is_null() {
+            let _ = unsafe { CloseHandle(mapping) };
+            log("MapViewOfFile failed");
+            return Err(3);
+        }
+        view_value = view.Value as usize;
+        SHARED.store(view_value, Ordering::Release);
     }
-    .map_err(|error| {
-        log(&format!("CreateFileMappingW failed: {error}"));
-        2
-    })?;
-    let view = unsafe {
-        MapViewOfFile(
-            mapping,
-            FILE_MAP_ALL_ACCESS,
-            0,
-            0,
-            HEADER_SIZE + RING_CAPACITY,
-        )
-    };
-    if view.Value.is_null() {
-        log("MapViewOfFile failed");
-        return Err(3);
-    }
-    let header = view.Value as *mut Header;
-    unsafe { ptr::write_bytes(view.Value as *mut u8, 0, HEADER_SIZE) };
+    let view = view_value as *mut u8;
+    let header = view as *mut Header;
+    unsafe { ptr::write_bytes(view, 0, HEADER_SIZE) };
     unsafe {
         (*header).magic = MAGIC;
         (*header).version = VERSION;
         (*header).capacity = RING_CAPACITY as u64;
     }
-    SHARED.store(view.Value as usize, Ordering::Release);
 
-    // Created after the mapping so a failed setup never leaves a wake handle
-    // behind, and before the hook so the first rendered frame can signal it.
-    let wake = claim_wake_event(pid);
+    // Created before the hook so the first rendered frame can signal it.
+    if WAKE.load(Ordering::Acquire) == 0 {
+        claim_wake_event(pid);
+    }
 
     if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
         log("CoInitializeEx failed");
@@ -457,7 +471,7 @@ fn setup() -> Result<(), i32> {
     }
     log(&format!(
         "patched pid={pid} vtable={vtable:p} get={get_buffer:x} release={release_buffer:x} wake={:p}",
-        wake.0
+        WAKE.load(Ordering::Acquire) as *mut c_void
     ));
     Ok(())
 }
