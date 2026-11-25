@@ -1,0 +1,28 @@
+[package]
+name = "clubify-spotify-tap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "GPL-3.0"
+description = "In-process Spotify render-buffer tap and silencer for Clubify"
+
+[lib]
+name = "clubify_spotify_tap"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_Media_Multimedia",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
