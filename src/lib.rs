@@ -228,11 +228,15 @@ fn setup() -> Result<(), i32> {
         }
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        log("another tap version already owns this process");
+        let owned = HOOK_MUTEX.load(Ordering::SeqCst);
         let _ = unsafe { CloseHandle(mutex) };
-        return Ok(());
+        if owned == 0 {
+            log("another tap version already owns this process");
+            return Ok(());
+        }
+    } else {
+        HOOK_MUTEX.store(mutex.0 as usize, Ordering::SeqCst);
     }
-    HOOK_MUTEX.store(mutex.0 as usize, Ordering::SeqCst);
 
     let mapping_name = wide(&format!("Local\\SpotifyTap_{pid}_v1"));
     let mapping: HANDLE = unsafe {
@@ -368,8 +372,8 @@ fn setup() -> Result<(), i32> {
         14
     })?;
     unsafe {
-        ptr::write(vtable.add(3), get_buffer_hook as usize);
-        ptr::write(vtable.add(4), release_buffer_hook as usize);
+        ptr::write(vtable.add(3), get_buffer_hook as *const () as usize);
+        ptr::write(vtable.add(4), release_buffer_hook as *const () as usize);
     }
 
     unsafe {
@@ -396,6 +400,10 @@ pub extern "system" fn StartTap() -> i32 {
         Ok(()) => 0,
         Err(code) => {
             STARTED.store(false, Ordering::SeqCst);
+            let handle = HOOK_MUTEX.swap(0, Ordering::SeqCst);
+            if handle != 0 {
+                let _ = unsafe { CloseHandle(HANDLE(handle as *mut c_void)) };
+            }
             code
         }
     }

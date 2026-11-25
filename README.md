@@ -1,4 +1,4 @@
-# spotify-tap
+﻿# spotify-tap
 
 An in-process audio tap for Spotify on Windows.
 
@@ -140,4 +140,4 @@ The DLL appends diagnostics to `%TEMP%\spotify-tap.log`, including the detected 
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Note that `Cargo.toml` still declares `GPL-3.0`; the LICENSE file is authoritative until those are reconciled.
+MIT - see [LICENSE](LICENSE).
