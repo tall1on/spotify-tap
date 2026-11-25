@@ -198,9 +198,8 @@ unsafe extern "system" fn release_buffer_hook(
         if let Some(state) = state {
             let frame_bytes = FRAME_BYTES.load(Ordering::Relaxed) as usize;
             let format_ok = FORMAT_TAG.load(Ordering::Relaxed) == WAVE_FORMAT_IEEE_FLOAT
-                && frame_bytes > 0
-                && CHANNELS.load(Ordering::Relaxed) > 0
-                && frame_bytes == CHANNELS.load(Ordering::Relaxed) as usize * 4;
+                && frame_bytes == 8
+                && CHANNELS.load(Ordering::Relaxed) == 2;
             if format_ok && ACTIVE.load(Ordering::Acquire) && reader_active() {
                 let frames = frames.min(state.requested_frames) as usize;
                 let bytes = frames * frame_bytes;
@@ -310,11 +309,6 @@ fn setup() -> Result<(), i32> {
     let bits_per_sample = format.wBitsPerSample;
     let block_align = format.nBlockAlign;
     let cb_size = format.cbSize;
-    let channel_mask = if format_tag == WAVE_FORMAT_EXTENSIBLE && cb_size >= 22 {
-        unsafe { ptr::read_unaligned((mix_format as *const u8).add(20) as *const u32) }
-    } else {
-        0
-    };
     let ieee_float = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
     let is_float = if format_tag as u32 == WAVE_FORMAT_IEEE_FLOAT {
         true
@@ -326,7 +320,7 @@ fn setup() -> Result<(), i32> {
         false
     };
     log(&format!(
-        "pid={pid} mix format tag={format_tag} channels={channels} rate={sample_rate} bits={bits_per_sample} block={block_align} mask=0x{channel_mask:X} float={is_float}"
+        "pid={pid} endpoint mix tag={format_tag} channels={channels} rate={sample_rate} bits={bits_per_sample} block={block_align} float={is_float}; tap render format=stereo"
     ));
     if !is_float
         || channels == 0
@@ -334,13 +328,16 @@ fn setup() -> Result<(), i32> {
         || block_align as usize != channels as usize * size_of::<f32>()
     {
         unsafe { CoTaskMemFree(Some(mix_format as *const c_void)) };
-        log("unsupported mix format (need float32 with 1-8 channels)");
+        log("unsupported endpoint mix format (need float32)");
         return Err(9);
     }
+    // Spotify desktop uses a float32 stereo render client even when Windows
+    // upmixes the endpoint to 5.1/7.1. The endpoint mix is used only to reach
+    // the shared IAudioRenderClient vtable; never size the render buffer from it.
     FORMAT_TAG.store(WAVE_FORMAT_IEEE_FLOAT, Ordering::SeqCst);
-    CHANNELS.store(channels as u32, Ordering::SeqCst);
+    CHANNELS.store(2, Ordering::SeqCst);
     SAMPLE_RATE.store(sample_rate, Ordering::SeqCst);
-    FRAME_BYTES.store(block_align as u32, Ordering::SeqCst);
+    FRAME_BYTES.store(8, Ordering::SeqCst);
 
     let initialized = unsafe {
         client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 0, 0, mix_format, None)
@@ -396,7 +393,7 @@ fn setup() -> Result<(), i32> {
         (*header).channels = CHANNELS.load(Ordering::SeqCst);
         (*header).frame_bytes = FRAME_BYTES.load(Ordering::SeqCst);
         (*header).format_tag = FORMAT_TAG.load(Ordering::SeqCst);
-        (*header).channel_mask = channel_mask;
+        (*header).channel_mask = 0;
         (*header).magic = MAGIC;
         (*header).version = VERSION;
     }
