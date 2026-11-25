@@ -3,7 +3,7 @@ name = "spotify-tap"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-license = "GPL-3.0"
+license = "MIT"
 description = "In-process Spotify render-buffer tap and silencer"
 
 [lib]
