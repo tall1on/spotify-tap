@@ -3,6 +3,7 @@ node_modules/
 
 # Build output
 /target/
+/dist/
 
 # TypeScript and test caches
 *.tsbuildinfo
@@ -18,6 +19,3 @@ node_modules/
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Note: vendor/loopback-capture/dist and build/Release are intentionally tracked
-# so the patched capture addon ships prebuilt.

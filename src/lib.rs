@@ -1,11 +1,11 @@
-//! Clubify's in-process Spotify audio tap.
+//! An in-process Spotify audio tap.
 //!
 //! The DLL is injected into the Spotify main process. It replaces the shared
 //! `IAudioRenderClient` `GetBuffer`/`ReleaseBuffer` vtable entries, copies the
 //! rendered float32 stereo frames into a shared-memory ring, and zeroes the
-//! render buffer before handing it back to Spotify. A reader in Clubify keeps a
+//! render buffer before handing it back to Spotify. A consumer process keeps a
 //! heartbeat in the shared header; when the heartbeat stops the hook passes
-//! audio through again, so a crashed or stopped Clubify never leaves Spotify
+//! audio through again, so a crashed or stopped consumer never leaves Spotify
 //! permanently silent.
 
 use std::{
@@ -48,7 +48,7 @@ use windows::{
     },
 };
 
-const MAGIC: u32 = 0x434C_4254; // "CLBT"
+const MAGIC: u32 = 0x5054_5053; // "SPTP"
 const VERSION: u32 = 1;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 const HEADER_SIZE: usize = 64;
@@ -96,7 +96,7 @@ fn buffers() -> &'static Mutex<HashMap<usize, BufferState>> {
 }
 
 fn log(message: &str) {
-    let path = std::env::temp_dir().join("clubify-tap.log");
+    let path = std::env::temp_dir().join("spotify-tap.log");
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{message}");
     }
@@ -218,7 +218,7 @@ unsafe extern "system" fn release_buffer_hook(
 
 fn setup() -> Result<(), i32> {
     let pid = unsafe { GetCurrentProcessId() };
-    let mutex_name = wide(&format!("Local\\ClubifySpotifyTapHook_{pid}_v1"));
+    let mutex_name = wide(&format!("Local\\SpotifyTapHook_{pid}_v1"));
     unsafe { SetLastError(WIN32_ERROR(0)) };
     let mutex: HANDLE = match unsafe { CreateMutexW(None, false, PCWSTR(mutex_name.as_ptr())) } {
         Ok(handle) => handle,
@@ -234,7 +234,7 @@ fn setup() -> Result<(), i32> {
     }
     HOOK_MUTEX.store(mutex.0 as usize, Ordering::SeqCst);
 
-    let mapping_name = wide(&format!("Local\\ClubifySpotifyTap_{pid}_v1"));
+    let mapping_name = wide(&format!("Local\\SpotifyTap_{pid}_v1"));
     let mapping: HANDLE = unsafe {
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,

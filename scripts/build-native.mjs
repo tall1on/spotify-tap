@@ -5,17 +5,11 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
-const destination = join(
-  root,
-  "..",
-  "loopback-capture",
-  "build",
-  "Release",
-  "clubify_spotify_tap.dll",
-);
+const destination = join(root, "dist", "spotify_tap.dll");
 
-// The DLL is loaded inside Spotify, so a running Spotify locks its copy. The
-// engine injects a hash-named copy from LOCALAPPDATA; this source stays free.
+// The DLL is loaded inside Spotify, so a running Spotify locks its copy.
+// Loaders should inject a private copy (for example from LOCALAPPDATA) so this
+// build output stays free to replace.
 await rm(destination, { force: true });
 const cargo = spawn(
   "cargo",
@@ -37,7 +31,7 @@ output.on("line", (line) => {
   }
   if (
     message.reason === "compiler-artifact" &&
-    message.target.name === "clubify_spotify_tap" &&
+    message.target.name === "spotify_tap" &&
     message.target.crate_types.includes("cdylib")
   ) {
     artifact = message.filenames.find((path) => path.endsWith(".dll"));
@@ -49,7 +43,7 @@ const exitCode = await new Promise((resolve, reject) => {
   cargo.on("close", (code) => resolve(code ?? 1));
 });
 if (exitCode !== 0) process.exit(exitCode);
-if (!artifact) throw new Error("Cargo did not produce clubify_spotify_tap.dll");
+if (!artifact) throw new Error("Cargo did not produce spotify_tap.dll");
 await mkdir(dirname(destination), { recursive: true });
 const temporary = `${destination}.tmp`;
 await copyFile(artifact, temporary);
