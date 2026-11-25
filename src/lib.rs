@@ -19,7 +19,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Mutex, OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows::{
     core::{GUID, Interface, HRESULT, PCWSTR},
@@ -66,7 +66,7 @@ struct Header {
     channels: u32,
     frame_bytes: u32,
     format_tag: u32,
-    reserved0: u32,
+    channel_mask: u32,
     reserved1: u32,
     heartbeat_ms: AtomicU64,
     write_bytes: AtomicU64,
@@ -89,6 +89,10 @@ static SAMPLE_RATE: AtomicU32 = AtomicU32::new(0);
 static FRAME_BYTES: AtomicU32 = AtomicU32::new(0);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static HOOK_MUTEX: AtomicUsize = AtomicUsize::new(0);
+static VTABLE: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static RESTORE_LOCK: Mutex<()> = Mutex::new(());
 
 fn buffers() -> &'static Mutex<HashMap<usize, BufferState>> {
     static BUFFERS: OnceLock<Mutex<HashMap<usize, BufferState>>> = OnceLock::new();
@@ -195,8 +199,9 @@ unsafe extern "system" fn release_buffer_hook(
             let frame_bytes = FRAME_BYTES.load(Ordering::Relaxed) as usize;
             let format_ok = FORMAT_TAG.load(Ordering::Relaxed) == WAVE_FORMAT_IEEE_FLOAT
                 && frame_bytes > 0
-                && CHANNELS.load(Ordering::Relaxed) == 2;
-            if format_ok && reader_active() {
+                && CHANNELS.load(Ordering::Relaxed) > 0
+                && frame_bytes == CHANNELS.load(Ordering::Relaxed) as usize * 4;
+            if format_ok && ACTIVE.load(Ordering::Acquire) && reader_active() {
                 let frames = frames.min(state.requested_frames) as usize;
                 let bytes = frames * frame_bytes;
                 if bytes > 0 {
@@ -305,6 +310,11 @@ fn setup() -> Result<(), i32> {
     let bits_per_sample = format.wBitsPerSample;
     let block_align = format.nBlockAlign;
     let cb_size = format.cbSize;
+    let channel_mask = if format_tag == WAVE_FORMAT_EXTENSIBLE && cb_size >= 22 {
+        unsafe { ptr::read_unaligned((mix_format as *const u8).add(20) as *const u32) }
+    } else {
+        0
+    };
     let ieee_float = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
     let is_float = if format_tag as u32 == WAVE_FORMAT_IEEE_FLOAT {
         true
@@ -316,11 +326,15 @@ fn setup() -> Result<(), i32> {
         false
     };
     log(&format!(
-        "pid={pid} mix format tag={format_tag} channels={channels} rate={sample_rate} bits={bits_per_sample} block={block_align} float={is_float}"
+        "pid={pid} mix format tag={format_tag} channels={channels} rate={sample_rate} bits={bits_per_sample} block={block_align} mask=0x{channel_mask:X} float={is_float}"
     ));
-    if !is_float || channels != 2 || block_align != 8 {
+    if !is_float
+        || channels == 0
+        || channels > 8
+        || block_align as usize != channels as usize * size_of::<f32>()
+    {
         unsafe { CoTaskMemFree(Some(mix_format as *const c_void)) };
-        log("unsupported mix format (need float32 stereo)");
+        log("unsupported mix format (need float32 with 1-8 channels)");
         return Err(9);
     }
     FORMAT_TAG.store(WAVE_FORMAT_IEEE_FLOAT, Ordering::SeqCst);
@@ -375,12 +389,14 @@ fn setup() -> Result<(), i32> {
         ptr::write(vtable.add(3), get_buffer_hook as *const () as usize);
         ptr::write(vtable.add(4), release_buffer_hook as *const () as usize);
     }
+    VTABLE.store(vtable as usize, Ordering::SeqCst);
 
     unsafe {
         (*header).sample_rate = SAMPLE_RATE.load(Ordering::SeqCst);
         (*header).channels = CHANNELS.load(Ordering::SeqCst);
         (*header).frame_bytes = FRAME_BYTES.load(Ordering::SeqCst);
         (*header).format_tag = FORMAT_TAG.load(Ordering::SeqCst);
+        (*header).channel_mask = channel_mask;
         (*header).magic = MAGIC;
         (*header).version = VERSION;
     }
@@ -395,16 +411,116 @@ pub extern "system" fn StartTap() -> i32 {
     if STARTED.swap(true, Ordering::SeqCst) {
         return 0;
     }
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     log("StartTap");
     match setup() {
-        Ok(()) => 0,
+        Ok(()) => {
+            if VTABLE.load(Ordering::SeqCst) != 0 {
+                ACTIVE.store(true, Ordering::SeqCst);
+                spawn_monitor(generation);
+            }
+            0
+        }
         Err(code) => {
             STARTED.store(false, Ordering::SeqCst);
+            ACTIVE.store(false, Ordering::SeqCst);
             let handle = HOOK_MUTEX.swap(0, Ordering::SeqCst);
             if handle != 0 {
                 let _ = unsafe { CloseHandle(HANDLE(handle as *mut c_void)) };
             }
             code
         }
+    }
+}
+
+/// Restores the original render vtable and releases the hook ownership. The
+/// DLL stays loaded, but it is inert and a later `StartTap` can patch again.
+#[no_mangle]
+pub extern "system" fn StopTap() -> i32 {
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    restore_hook();
+    0
+}
+
+fn spawn_monitor(generation: u64) {
+    std::thread::spawn(move || {
+        let mut stale_since: Option<Instant> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if !STARTED.load(Ordering::SeqCst) {
+                return;
+            }
+            let header = unsafe { header() };
+            let fresh = if header.is_null() {
+                false
+            } else {
+                let heartbeat = unsafe { (*header).heartbeat_ms.load(Ordering::Acquire) };
+                heartbeat != 0
+                    && now_ms().saturating_sub(heartbeat) < HEARTBEAT_TIMEOUT_MS
+            };
+            if fresh {
+                stale_since = None;
+                continue;
+            }
+            let since = stale_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(2000) {
+                log("heartbeat stale; restoring render vtable");
+                restore_hook();
+                return;
+            }
+        }
+    });
+}
+
+fn restore_hook() {
+    let _guard = RESTORE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ACTIVE.store(false, Ordering::SeqCst);
+    let vtable = VTABLE.swap(0, Ordering::SeqCst);
+    if vtable != 0 {
+        let get_buffer = ORIG_GET_BUFFER.load(Ordering::SeqCst);
+        let release_buffer = ORIG_RELEASE_BUFFER.load(Ordering::SeqCst);
+        let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+        let vtable = vtable as *mut usize;
+        if unsafe {
+            VirtualProtect(
+                vtable.add(3) as *const c_void,
+                size_of::<usize>() * 2,
+                PAGE_EXECUTE_READWRITE,
+                &mut old_protect,
+            )
+        }
+        .is_ok()
+        {
+            unsafe {
+                ptr::write(vtable.add(3), get_buffer);
+                ptr::write(vtable.add(4), release_buffer);
+            }
+            let mut ignored = PAGE_PROTECTION_FLAGS(0);
+            unsafe {
+                let _ = VirtualProtect(
+                    vtable.add(3) as *const c_void,
+                    size_of::<usize>() * 2,
+                    old_protect,
+                    &mut ignored,
+                );
+            }
+            log(&format!("restored render vtable {vtable:p}"));
+        } else {
+            log("VirtualProtect failed while restoring the render vtable");
+        }
+    }
+    let header = unsafe { header() };
+    if !header.is_null() {
+        unsafe { (*header).heartbeat_ms.store(0, Ordering::Release) };
+    }
+    STARTED.store(false, Ordering::SeqCst);
+    let handle = HOOK_MUTEX.swap(0, Ordering::SeqCst);
+    if handle != 0 {
+        let _ = unsafe { CloseHandle(HANDLE(handle as *mut c_void)) };
     }
 }

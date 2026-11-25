@@ -2,7 +2,7 @@
 
 An in-process audio tap for Spotify on Windows.
 
-`spotify-tap` builds a small `cdylib` that is loaded into Spotify's main process. It hooks the process-wide audio render path, copies the rendered float32 stereo PCM into a shared-memory ring, and zeroes Spotify's own render buffer so nothing is heard from the default output device. Any separate process can map the ring and use the audio — for visualizers, recording, streaming, custom routing, or further DSP.
+`spotify-tap` builds a small `cdylib` that is loaded into Spotify's main process. It hooks the process-wide audio render path, copies the rendered float32 PCM (1–8 channels) into a shared-memory ring, and zeroes Spotify's own render buffer so nothing is heard from the default output device. Any separate process can map the ring and use the audio — for visualizers, recording, streaming, custom routing, or further DSP.
 
 The tap is self-contained and host-agnostic: it exports a single `StartTap()` function and a documented shared-memory ABI. Nothing in this repository depends on a particular consumer.
 
@@ -13,10 +13,10 @@ The tap is self-contained and host-agnostic: it exports a single `StartTap()` fu
 1. `StartTap()` creates a per-process mutex and a per-process file mapping, then opens the default render endpoint (`eRender` / `eConsole`) in shared mode to learn the mix format.
 2. It resolves the `IAudioRenderClient` vtable and overwrites slots 3 and 4 (`GetBuffer`, `ReleaseBuffer`) with hooks. The original entries are kept and always called, so Spotify's own audio pipeline continues to run.
 3. `GetBuffer` records the buffer pointer and the requested frame count for that `this` instance.
-4. `ReleaseBuffer` looks the buffer up, verifies the format (`WAVE_FORMAT_IEEE_FLOAT`, 2 channels, 8-byte block align), and — only while a consumer heartbeat is alive — copies the rendered frames into the shared ring and zeroes the source buffer before delegating to the original method.
-5. A consumer must publish a heartbeat roughly once per second. If it stops, crashes, or never attaches, the hooks pass audio through untouched, so Spotify is never left permanently silent.
+4. `ReleaseBuffer` looks the buffer up, verifies float32 and a consistent frame size (1–8 channels), and — only while a consumer heartbeat is alive — copies the rendered frames into the shared ring and zeroes the source buffer before delegating to the original method.
+5. A consumer must publish a heartbeat roughly once per second. If it stops, crashes, or never attaches, the hooks pass audio through untouched, so Spotify is never left permanently silent. A watchdog restores the original vtable after a stale heartbeat, so the hook does not remain installed when the consumer exits.
 
-The hook only touches the process's default render endpoint in shared mode, and only supports float32 stereo output. Unsupported formats stop setup with an error code instead of corrupting audio.
+The hook only touches the process's default render endpoint in shared mode, and only supports float32 output (1–8 channels). Unsupported formats stop setup with an error code instead of corrupting audio.
 
 ## Requirements
 
@@ -60,6 +60,14 @@ int32_t StartTap(void); // extern "system", idempotent
 
 Call it once after the DLL is loaded. A second call returns `0` without doing anything. Setup takes a process-wide mutex named `Local\SpotifyTapHook_<pid>_v1`; if another version of the tap already owns the process, `StartTap` also returns `0` but leaves the existing hook in place.
 
+To uninstall the hook without unloading the DLL, call:
+
+```c
+int32_t StopTap(void); // extern "system", idempotent
+```
+
+It restores the original `GetBuffer`/`ReleaseBuffer` entries, cuts the shared heartbeat, and releases the hook mutex. The DLL stays loaded but inert. If the consumer disappears without calling `StopTap`, a watchdog restores the vtable after the heartbeat goes stale.
+
 ### 3. Read the audio
 
 Open the mapping described below, keep the heartbeat fresh, and drain the ring. The tap does not know or care what the consumer does with the samples.
@@ -77,16 +85,16 @@ All integers are little-endian `u32`/`u64`, and the header has C-compatible alig
 | 0      | `magic`        | `u32`  | `0x50545053` (`"SPTP"`) |
 | 4      | `version`      | `u32`  | `1` |
 | 8      | `sample_rate`  | `u32`  | Mix-format sample rate, filled in after setup |
-| 12     | `channels`     | `u32`  | Always `2` |
-| 16     | `frame_bytes`  | `u32`  | Always `8` (float32 stereo) |
+| 12     | `channels`     | `u32`  | Endpoint mix channel count (1–8) |
+| 16     | `frame_bytes`  | `u32`  | `channels * 4` |
 | 20     | `format_tag`   | `u32`  | `WAVE_FORMAT_IEEE_FLOAT` (`3`) |
-| 24     | `reserved0`    | `u32`  | Zero |
+| 24     | `channel_mask` | `u32`  | WAVEFORMATEXTENSIBLE channel mask, or `0` when unknown |
 | 28     | `reserved1`    | `u32`  | Zero |
 | 32     | `heartbeat_ms` | `u64`  | Consumer writes wall-clock milliseconds since the Unix epoch; `0` disables the tap |
 | 40     | `write_bytes`  | `u64`  | Producer counter, free-running |
 | 48     | `read_bytes`   | `u64`  | Consumer counter, free-running |
 | 56     | `capacity`     | `u64`  | `4 * 1024 * 1024` |
-| 64     | ring           | bytes  | Raw interleaved float32 stereo PCM |
+| 64     | ring           | bytes  | Raw interleaved float32 PCM; downmix if `channels != 2` |
 
 Consumer protocol:
 
@@ -113,7 +121,7 @@ The consumer counter is only used to bound the producer: if `write_bytes - read_
 | 6    | `GetDefaultAudioEndpoint` failed |
 | 7    | `Activate(IAudioClient)` failed |
 | 8    | `GetMixFormat` failed |
-| 9    | Unsupported mix format (needs float32 stereo) |
+| 9    | Unsupported mix format (needs float32 with 1–8 channels) |
 | 10   | `IAudioClient::Initialize` failed |
 | 11   | `GetService(IAudioRenderClient)` failed |
 | 12   | Render client vtable is null |
@@ -124,7 +132,7 @@ The consumer counter is only used to bound the producer: if `write_bytes - read_
 
 The DLL appends diagnostics to `%TEMP%\spotify-tap.log`, including the detected mix format and the patched vtable addresses. If the tap starts but no audio appears in the ring:
 
-- Confirm the log shows `float=true`, `channels=2`, `block=8`, and a `patched pid=...` line.
+- Confirm the log shows `float=true`, a `channels=` value from 1–8, `block = channels * 4`, and a `patched pid=...` line.
 - Confirm the consumer is writing `heartbeat_ms` frequently enough; without it the tap deliberately passes audio through.
 - Confirm the consumer is mapping `Local\SpotifyTap_<pid>_v1` for the correct PID.
 - Code signing or anti-cheat software may block injection or vtable patching; `VirtualProtect` error 14 is the usual symptom.
@@ -134,9 +142,10 @@ The DLL appends diagnostics to `%TEMP%\spotify-tap.log`, including the detected 
 - Windows x64 only.
 - Hooks the default console render endpoint only; switching audio devices requires restarting the tap.
 - The heartbeat is compared with wall-clock time, so a large system clock adjustment can briefly pause capture (audio passes through instead).
-- Shared-mode float32 stereo output only. Exclusive mode, non-float mix formats, and multichannel endpoints are rejected.
+- Shared-mode float32 output only. The tap captures 1–8 channels and leaves downmixing to the consumer; exclusive mode and non-float mix formats are rejected.
 - Targets the Spotify main process; other applications are not supported.
 - No code signing is performed.
+- `StopTap` and the stale-heartbeat watchdog restore the render vtable, but the DLL itself stays loaded in Spotify until the Spotify process exits. A later `StartTap` can reinstall the hook.
 
 ## License
 
